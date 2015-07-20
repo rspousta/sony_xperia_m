@@ -49,6 +49,9 @@ static DEFINE_PER_CPU(struct cpufreq_cpu_save_data, cpufreq_policy_save);
 #endif
 static DEFINE_SPINLOCK(cpufreq_driver_lock);
 
+static struct kset *cpufreq_kset;
+static struct kset *cpudev_kset;
+
 /*
  * cpu_policy_rwsem is a per CPU reader-writer semaphore designed to cure
  * all cpufreq/hotplug/workqueue/etc related lock issues.
@@ -504,6 +507,8 @@ static ssize_t store_scaling_governor(struct cpufreq_policy *policy,
 
 	sysfs_notify(&policy->kobj, NULL, "scaling_governor");
 
+	kobject_uevent(cpufreq_global_kobject, KOBJ_ADD);
+
 	if (ret)
 		return ret;
 	else
@@ -618,9 +623,67 @@ static ssize_t show_bios_limit(struct cpufreq_policy *policy, char *buf)
 	}
 	return sprintf(buf, "%u\n", policy->cpuinfo.max_freq);
 }
+ 
+ extern ssize_t acpuclk_get_vdd_levels_str(char *buf);
+ extern void acpuclk_set_vdd(unsigned acpu_khz, int vdd);
+ 
+ static ssize_t show_vdd_levels(struct kobject *a, struct attribute *b, char *buf) {
+   return acpuclk_get_vdd_levels_str(buf);
+ }
+ 
+ static ssize_t store_vdd_levels(struct kobject *a, struct attribute *b, const char *buf, size_t count) {
+ 
+   int i = 0, j;
+   int pair[2] = { 0, 0 };
+   int sign = 0;
+ 
+   if (count < 1)
+     return 0;
+ 
+   if (buf[0] == '-') {
+     sign = -1;
+     i++;
+   }
+   else if (buf[0] == '+') {
+     sign = 1;
+     i++;
+   }
 
-/*cpufreq_freq_attr_ro_perm(cpuinfo_cur_freq, 0400);*//*KERNEL-SC-get-cpu-frequency-01-*/
-cpufreq_freq_attr_ro(cpuinfo_cur_freq);/*change the authority of cpuinfo_cur_freq file node to 0444.*//*KERNEL-SC-get-cpu-frequency-01+*/
+  for (j = 0; i < count; i++) {
+
+    char c = buf[i];
+
+    if ((c >= '0') && (c <= '9')) {
+      pair[j] *= 10;
+      pair[j] += (c - '0');
+    }
+    else if ((c == ' ') || (c == '\t')) {
+      if (pair[j] != 0) {
+        j++;
+
+        if ((sign != 0) || (j > 1))
+          break;
+      }
+    }
+    else
+      break;
+  }
+
+  if (sign != 0) {
+    if (pair[0] > 0)
+      acpuclk_set_vdd(0, sign * pair[0]);
+  }
+  else {
+    if ((pair[0] > 0) && (pair[1] > 0))
+      acpuclk_set_vdd((unsigned)pair[0], pair[1]);
+    else
+      return -EINVAL;
+  }
+  return count;
+}
+
+
+cpufreq_freq_attr_ro_perm(cpuinfo_cur_freq, 0400);
 cpufreq_freq_attr_ro(cpuinfo_min_freq);
 cpufreq_freq_attr_ro(cpuinfo_max_freq);
 cpufreq_freq_attr_ro(cpuinfo_transition_latency);
@@ -636,6 +699,8 @@ cpufreq_freq_attr_rw(scaling_max_freq);
 cpufreq_freq_attr_rw(scaling_governor);
 cpufreq_freq_attr_rw(scaling_setspeed);
 
+define_one_global_rw(vdd_levels);
+
 static struct attribute *default_attrs[] = {
 	&cpuinfo_min_freq.attr,
 	&cpuinfo_max_freq.attr,
@@ -650,6 +715,16 @@ static struct attribute *default_attrs[] = {
 	&scaling_available_governors.attr,
 	&scaling_setspeed.attr,
 	NULL
+};
+
+static struct attribute *vddtbl_attrs[] = {
+  &vdd_levels.attr,
+  NULL
+};
+
+static struct attribute_group vddtbl_attr_group = {
+  .attrs = vddtbl_attrs,
+  .name = "vdd_table",
 };
 
 struct kobject *cpufreq_global_kobject;
@@ -860,6 +935,16 @@ static int cpufreq_add_dev_interface(unsigned int cpu,
 				   &dev->kobj, "cpufreq");
 	if (ret)
 		return ret;
+
+	/* create cpu device kset */
+	if (!cpudev_kset) {
+		cpudev_kset = kset_create_and_add("kset", NULL, &dev->kobj);
+		BUG_ON(!cpudev_kset);
+		dev->kobj.kset = cpudev_kset;
+	}
+
+	/* send uevent when cpu device is added */
+	kobject_uevent(&dev->kobj, KOBJ_ADD);
 
 	/* set up files for this cpu device */
 	drv_attr = cpufreq_driver->attr;
@@ -1719,7 +1804,8 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 	memcpy(&policy->cpuinfo, &data->cpuinfo,
 				sizeof(struct cpufreq_cpuinfo));
 
-	if (policy->min > data->max || policy->max < data->min) {
+	if (policy->min > data->user_policy.max
+		|| policy->max < data->user_policy.min) {
 		ret = -EINVAL;
 		goto error_out;
 	}
@@ -1989,6 +2075,9 @@ static int __init cpufreq_core_init(void)
 {
 	int cpu;
 
+  int rc;
+
+
 	if (cpufreq_disabled())
 		return -ENODEV;
 
@@ -1999,7 +2088,17 @@ static int __init cpufreq_core_init(void)
 
 	cpufreq_global_kobject = kobject_create_and_add("cpufreq", &cpu_subsys.dev_root->kobj);
 	BUG_ON(!cpufreq_global_kobject);
+
+	/* create cpufreq kset */
+	cpufreq_kset = kset_create_and_add("kset", NULL, cpufreq_global_kobject);
+	BUG_ON(!cpufreq_kset);
+	cpufreq_global_kobject->kset = cpufreq_kset;
+
 	register_syscore_ops(&cpufreq_syscore_ops);
+
+
+  rc = sysfs_create_group(cpufreq_global_kobject, &vddtbl_attr_group);
+
 
 	return 0;
 }
